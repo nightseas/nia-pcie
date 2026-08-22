@@ -1,0 +1,20 @@
+# all run output
+build/
+build_pdi*/
+sim_build/
+sim_build_*/
+mut_work/
+elab_refuse/
+obj_dir/
+__pycache__/
+*.pyc
+*.log
+*.jou
+*.pdi
+*.dcp
+*.vcd
+*.o
+*.so
+*.a
+results*.xml
+.Xil/

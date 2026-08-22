@@ -1,0 +1,1 @@
+verilator	pcie_tlp_fifo_raw.v takes zero width part selects at OUT_TLP_SEG_COUNT = 1, and verilator 5 rejects them as an IEEE 1800-2023 11.5.1 violation that no -Wno- flag reaches. Run this set under icarus.

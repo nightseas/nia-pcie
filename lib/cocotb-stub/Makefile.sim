@@ -1,0 +1,11 @@
+# ---------------------------------------------------------------------------
+# File        : Makefile.sim
+# Description : Intentionally empty make fragment. The cocotb-config stand-in in
+#               this directory reports this directory, so a simulation Makefile
+#               parses without cocotb installed. It defines no rule.
+# Author      : Xiaohai Li <haixiaolee@gmail.com>
+#
+#
+# Copyright (c) 2026 Xiaohai Li <haixiaolee@gmail.com>
+# SPDX-License-Identifier: BSD-2-Clause-Views
+# ---------------------------------------------------------------------------

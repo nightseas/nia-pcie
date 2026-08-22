@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# File        : nia-pcie
+# Description : Entry point for nia-pcie. Implements every target the Makefile
+#               delegates: dependency check, hardware-free structural check,
+#               and the licence-free simulation set.
+# Author      : Xiaohai Li <haixiaolee@gmail.com>
+#
+#
+# Copyright (c) 2026 Xiaohai Li <haixiaolee@gmail.com>
+# SPDX-License-Identifier: BSD-2-Clause-Views
+# ---------------------------------------------------------------------------
+set -u
+
+ROOT="$(d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; until [ -f "$d/.nia-repo-root" ]; do [ "$d" = / ] && exit 1; d="$(dirname "$d")"; done; printf '%s' "$d")"
+[ -n "$ROOT" ] || { echo "nia-pcie: cannot find .nia-repo-root above this script" >&2; exit 1; }
+cd "$ROOT"
+
+fail=0
+pending=0
+note() { printf '  %-52s %s\n' "$1" "$2"; }
+bad()  { note "$1" "$2"; fail=$((fail + 1)); }
+
+cmd_help() {
+	cat <<EOF
+nia-pcie 0.1.0
+
+  make help              this text
+  make deps              report every submodule this repository consumes
+  make check             hardware free: layout, scripts, source lists, submodules
+  make sim               every licence-free simulation set (needs verilator and cocotb)
+  make list              every simulation entry point
+  make image             build a device image, NIA_CPM selects which (needs Vivado)
+  make targets           the release targets this repository supports
+  make clean             remove simulation output
+
+NIA_CPM selects the CPM5 PCIe configuration that make image builds:
+  NIA_CPM=GEN4 make image    Gen4 x8 link, 512-bit AXIS. The default, so make image alone
+  NIA_CPM=GEN5 make image    Gen5 x8 link, 1024-bit AXIS
+  GEN4X8 and GEN5X8 are accepted, and the value is not case sensitive.
+
+Every target folder is also its own entry point, so a copied folder needs one line:
+  cd example/TU03/gen5x8      && make        build that image
+  cd sim/gen5x8               && make        run every gen5x8 simulation set
+  cd sim/gen5x8/cqcc_gearbox  && make        run that one set
+  A folder finds the repository by walking up for .nia-repo-root. Set NIA_ROOT when
+  the folder has been copied outside the tree. A folder carries its own NIA_CPM, so
+  it refuses to run if NIA_CPM asks for the other configuration.
+
+Image:
+  NIA_CPM            the CPM5 PCIe configuration, GEN4 or GEN5, default GEN4
+  NIA_VIVADO_BIN     the tool executable, default vivado
+  NIA_VERILOG_PCIE   where the PCIe library is, if the submodule is not populated
+  NIA_ROOT           where this repository is, if a build folder was copied out of it
+  It passes on: every CPM_CONFIG word read back out of the generated IP, no negative
+  slack, no failing path, no unconstrained clock, an image written, and the script's
+  own end marker. The tool's exit status alone does not decide it.
+
+Example designs:
+  GEN4               example/TU03/gen4x8, Gen4 x8 link, 512-bit AXIS
+  GEN5               example/TU03/gen5x8, Gen5 x8 link, 1024-bit AXIS
+  GEN5 adds four gates: the generated tuser and tdata widths, that
+  every implementation directive read back as requested, that the IP set was keyed
+  on the requested configuration, and that a digest of the RTL was written beside
+  the image.
+
+Implementation directives, NIA_CPM=GEN5 only, each with its default:
+  NIA_ROUTE_DIRECTIVE                   HigherDelayCost
+  NIA_PHYS_OPT_DIRECTIVE                AggressiveExplore
+  NIA_PHYS_OPT                          1
+  NIA_POST_ROUTE_PHYS                   1
+  NIA_POST_ROUTE_PHYS_OPT_DIRECTIVE     unset, the tool's own default
+  NIA_OPT_DIRECTIVE                     unset, the tool's own default
+  NIA_PLACE_DIRECTIVE                   unset, the tool's own default
+  The legal set is per step and an illegal value is demoted to Default without an
+  error, so every directive property is read back after it is set and printed.
+
+Simulation:
+  NIA_SIM_MATCH      run only the sets whose entry point path contains this text
+  NIA_SIM_ARGS       arguments passed to each set, for example SIM=icarus or SEED=2
+  A set needs cocotb and either verilator 4.106 or newer, or icarus 10.3 or newer.
+  Every set of this repository declares its own simulator; SIM=... overrides it.
+
+Environment:
+  NIA_ETH, NIA_VERILOG_PCIE, NIA_DPDK
+      Override where a consumed repository is found. Each defaults to its
+      submodule path, so an initialised clone needs no environment at all.
+EOF
+}
+
+cmd_deps() {
+	if [ ! -f .gitmodules ]; then
+		note "submodules" "none: this repository consumes no other"
+		return 0
+	fi
+	local path url root
+	while read -r key eq val; do
+		case "$key" in
+		path) path="$val" ;;
+		url)  url="$val"
+		      root="$(mount_root "$path")"
+		      if [ -n "$root" ]; then
+			      if [ "$root" = "$path" ]; then
+				      note "$path" "present"
+			      else
+				      note "$path" "present at $root"
+			      fi
+		      else
+			      note "$path" "PENDING - git submodule update --init $path   ($url)"
+			      pending=$((pending + 1))
+		      fi ;;
+		esac
+	done < <(sed -n 's/^\t*\(path\|url\) *\(=\) *\(.*\)$/\1 \2 \3/p' .gitmodules)
+	return 0
+}
+
+cmd_list() {
+	local mk name sets=() entries=()
+	while IFS= read -r mk; do
+		name="${mk#./}"
+		[ -n "${NIA_SIM_MATCH:-}" ] && case "$name" in *"$NIA_SIM_MATCH"*) ;; *) continue ;; esac
+		if grep -qE '^[ \t]*(VERILOG_SOURCES|VHDL_SOURCES)[ \t]*(\+?=|:=)' "$mk"; then
+			sets+=("$name")
+		else
+			entries+=("$name")
+		fi
+	done < <(find . -path ./.git -prune -o -path ./lib/cocotb-stub -prune -o -name 'mut_work' -prune -o -name 'sim_build*' -prune -o -name 'obj_dir' -prune -o \( -name 'Makefile' -o -name 'Makefile.*' \) -print \
+	  | grep -v '^\./Makefile$' | grep -vE "$NIA_MOUNT_FILTER" | sort)
+	echo "simulation sets, which is what make sim runs:"
+	if [ "${#sets[@]}" -eq 0 ]; then echo "  none"; else printf '  %s\n' "${sets[@]}"; fi
+	echo "folder entry points, one bare make each:"
+	if [ "${#entries[@]}" -eq 0 ]; then echo "  none"; else printf '  %s\n' "${entries[@]}"; fi
+}
+
+NIA_MOUNT_FILTER='^\./(eth|verilog-pcie|dpdk)/'
+
+mount_root() {
+	local m="$1" var sib
+	case "$m" in
+	eth)              var="${NIA_ETH:-}" ;;
+	verilog-pcie)     var="${NIA_VERILOG_PCIE:-}" ;;
+	dpdk)             var="${NIA_DPDK:-}" ;;
+	*) var="" ;;
+	esac
+	if [ -n "$var" ] && [ -d "$var" ]; then printf '%s' "$var"; return 0; fi
+	if [ -n "$(ls -A "$m" 2>/dev/null | grep -v '^\.gitkeep$')" ]; then printf '%s' "$m"; return 0; fi
+	case "$m" in
+	eth)  sib="../nia-eth" ;;
+	dpdk) sib="../nia-dpdk-pmd" ;;
+	*)    sib="" ;;
+	esac
+	[ -n "$sib" ] && [ -d "$sib" ] && { printf '%s' "$sib"; return 0; }
+	printf ''
+}
+
+resolve_source() {
+	local s="$1" rel m root tail
+	[ -f "$s" ] && return 0
+	rel="$(realpath -m --relative-to="$ROOT" "$s" 2>/dev/null || printf '%s' "${s#$ROOT/}")"
+	[ -f "$ROOT/$rel" ] && return 0
+	for m in eth verilog-pcie dpdk; do
+		case "$rel" in
+		"$m"/*)
+			tail="${rel#$m/}"
+			root="$(mount_root "$m")"
+			[ -z "$root" ] && return 1
+			[ -f "$root/$tail" ] && return 0
+			return 2 ;;
+		esac
+	done
+	return 2
+}
+
+cmd_own_check() {
+	local tcl out rc
+	tcl="$(find example -name '*.tcl' 2>/dev/null | sort)"
+	if [ -z "$tcl" ]; then
+		note "build scripts" "none"
+		return 0
+	fi
+	out="$(python3 lib/check_tcl_sources.py "$ROOT" $tcl 2>&1)"
+	rc=$?
+	printf '%s\n' "$out" | grep -v '^NIA_TCL' | grep -q . && printf '%s\n' "$out" | grep -v '^NIA_TCL'
+	note "build script sources" "$(printf '%s\n' "$out" | sed -n 's/^NIA_TCL //p')"
+	if [ "$rc" != 0 ]; then
+		fail=$((fail + rc))
+	fi
+	return 0
+}
+
+cmd_check() {
+	echo "nia-pcie: structural check"
+	[ -f VERSION ] || bad "VERSION" "missing"
+	[ -f LICENSE ] || bad "LICENSE" "missing"
+	[ -f .nia-repo-root ] || bad ".nia-repo-root" "missing"
+
+	local nsh=0 npy=0
+	while IFS= read -r f; do
+		nsh=$((nsh + 1))
+		bash -n "$f" 2>/dev/null || bad "$f" "shell syntax error"
+	done < <(find . -name '*.sh' -not -path './.git/*' | grep -vE "$NIA_MOUNT_FILTER")
+	note "shell scripts parsed" "$nsh"
+
+	while IFS= read -r f; do
+		npy=$((npy + 1))
+		python3 -m py_compile "$f" 2>/dev/null || bad "$f" "python syntax error"
+	done < <(find . -name '*.py' -not -path './.git/*' | grep -vE "$NIA_MOUNT_FILTER")
+	note "python files compiled" "$npy"
+	local n=$((nsh + npy))
+
+	local mk d total=0 missing=0 pend=0 s rc nmk=0 err out
+	err="$(mktemp)"
+	export PATH="$ROOT/lib/cocotb-stub:$PATH"
+	while IFS= read -r mk; do
+		grep -qE '^[ \t]*(VERILOG_SOURCES|SRC|SRCS)[ \t]*(\+?=|:=)' "$mk" || continue
+		nmk=$((nmk + 1))
+		d="$(dirname "$mk")"
+		out="$( cd "$d" && make -s --no-print-directory -f "$(basename "$mk")" \
+		        APP_DIR="$ROOT" APP="$ROOT" REPO="$ROOT" ROOT="$ROOT" NIA_ROOT="$ROOT" \
+		        --eval='nia_p:
+	@printf "%s\n" $(VERILOG_SOURCES) $(SRC) $(SRCS)' nia_p 2>"$err" )"
+		rc=$?
+		if [ "$rc" != 0 ]; then
+			if grep -qE 'No such file|not found|Nothing to be done' "$err"; then
+				note "$mk" "not expanded here: $(head -n 1 "$err" | cut -c1-60)"
+			else
+				note "$mk" "declines to expand: $(grep -m1 -oE '\*\*\*.*' "$err" | cut -c1-70)"
+			fi
+		fi
+		for s in $out; do
+			case "$s" in
+			*.sv|*.v|*.c|*.h) ;;
+			*) continue ;;
+			esac
+			case "$s" in /*) ;; *) s="$d/$s" ;; esac
+			total=$((total + 1))
+			resolve_source "$s"; rc=$?
+			if [ "$rc" = 1 ]; then
+				pend=$((pend + 1))
+			elif [ "$rc" = 2 ]; then
+				missing=$((missing + 1)); bad "$mk" "source missing: $s"
+			fi
+		done
+	done < <(find . -path ./.git -prune -o -name 'mut_work' -prune -o -name 'sim_build*' -prune -o -name 'obj_dir' -prune -o \( -name 'Makefile' -o -name 'Makefile.*' \) -print \
+	         | grep -v '^\./Makefile$' | grep -vE "$NIA_MOUNT_FILTER")
+	rm -f "$err"
+	note "simulation sources" "$total checked, $missing missing, $pend awaiting a submodule"
+
+	if [ "$nmk" -gt 0 ] && [ "$total" -eq 0 ]; then
+		bad "source lists" \
+		    "$nmk entry point(s) declare a source list but none resolved: nothing was verified"
+	fi
+	if [ "$total" -eq 0 ] && [ "$n" -eq 0 ]; then
+		bad "this check" "it verified nothing: no source list, no script, no python file"
+	fi
+	cmd_own_check
+	cmd_deps
+	cmd_targets
+
+	if [ "$fail" -eq 0 ]; then
+		if [ "$pending" -gt 0 ]; then
+			echo "nia-pcie: CHECK PASS  ($pending submodule(s) not yet initialised)"
+		else
+			echo "nia-pcie: CHECK PASS"
+		fi
+	else
+		echo "nia-pcie: CHECK FAIL, $fail problem(s)"
+	fi
+	return "$fail"
+}
+
+cmd_sim() {
+	local mk d rc=0 pass=0 bad=0 skipped=0 name mrc xml nf skip sim_sel
+	command -v cocotb-config >/dev/null || { echo "sim: cocotb is not installed"; return 1; }
+	command -v verilator >/dev/null || command -v iverilog >/dev/null || {
+		echo "sim: no simulator: install verilator 4.106 or newer, or icarus 10.3 or newer"
+		return 1
+	}
+	sim_sel="$(printf '%s' "${NIA_SIM_ARGS:-}" | sed -n 's/.*SIM=\([A-Za-z0-9_]\{1,\}\).*/\1/p')"
+	[ -n "$sim_sel" ] || sim_sel="${SIM:-icarus}"
+	while IFS= read -r mk; do
+		grep -qE '^[ \t]*(VERILOG_SOURCES|VHDL_SOURCES)[ \t]*(\+?=|:=)' "$mk" || continue
+		d="$(dirname "$mk")"
+		name="$(printf '%s' "${mk#./}")"
+		[ -n "${NIA_SIM_MATCH:-}" ] && case "$name" in *"$NIA_SIM_MATCH"*) ;; *) continue ;; esac
+		echo "== $name"
+		skip=""
+		if [ -f "$d/sim_skip" ]; then
+			skip="$(awk -F'\t' -v s="$sim_sel" '$1 == s { $1 = ""; sub(/^[ \t]+/, ""); print; exit }' "$d/sim_skip")"
+		fi
+		if [ -n "$skip" ]; then
+			echo "^^ $name SKIPPED under $sim_sel: $skip"
+			skipped=$((skipped + 1))
+			continue
+		fi
+		if ( cd "$d" && make -f "$(basename "$mk")" ${NIA_SIM_ARGS:-} ); then
+			mrc=0
+		else
+			mrc=1
+		fi
+		xml="$(find "$d" -maxdepth 1 -name 'results*.xml' 2>/dev/null | head -1)"
+		nf=0
+		if [ -n "$xml" ]; then
+			nf=$(( $(grep -o '<failure' "$xml" 2>/dev/null | wc -l) \
+			     + $(grep -o '<error' "$xml" 2>/dev/null | wc -l) ))
+		fi
+		if [ "$mrc" = 0 ] && [ -n "$xml" ] && [ "$nf" -eq 0 ]; then
+			pass=$((pass + 1))
+		else
+			bad=$((bad + 1)); rc=1
+			if [ -z "$xml" ]; then
+				echo "^^ $name FAILED: no result file was written"
+			else
+				echo "^^ $name FAILED: $nf failing test(s), make status $mrc"
+			fi
+		fi
+	done < <(find . -path ./.git -prune -o -path ./lib/cocotb-stub -prune -o \
+	         -name 'mut_work' -prune -o -name 'sim_build*' -prune -o -name 'obj_dir' -prune -o \
+	         \( -name 'Makefile' -o -name 'Makefile.*' \) -print \
+	         | grep -v '^\./Makefile$' | grep -vE "$NIA_MOUNT_FILTER" | sort)
+	if [ "$pass" -eq 0 ] && [ "$bad" -eq 0 ]; then
+		if [ "$skipped" -gt 0 ]; then
+			echo "nia-pcie: every set was skipped, so nothing was verified"
+		else
+			echo "nia-pcie: no simulation set was run, so nothing was verified"
+		fi
+		return 1
+	fi
+	echo "nia-pcie: simulation sets: $pass passed, $bad failed, $skipped skipped"
+	return "$rc"
+}
+
+cmd_image() {
+	if [ -n "${1:-}" ]; then
+		echo "image: the design is selected by NIA_CPM, not by an argument" >&2
+		echo "       use: NIA_CPM=GEN5 make image" >&2
+		return 2
+	fi
+	local cpm="${NIA_CPM:-GEN4}"
+	local design ip tcl outdir extra
+	case "$(printf '%s' "$cpm" | tr '[:lower:]' '[:upper:]')" in
+	GEN4|GEN4X8)
+		design="gen4x8"
+		ip="example/TU03/gen4x8/fpga/ip"
+		tcl="build_full_pdi.tcl"
+		outdir="example/TU03/gen4x8/fpga/build_pdi"
+		extra=0 ;;
+	GEN5|GEN5X8)
+		design="gen5x8"
+		ip="example/TU03/gen5x8/fpga/ip"
+		tcl="build_full_pdi_1024.tcl"
+		outdir="example/TU03/gen5x8/fpga/build_pdi_1024"
+		extra=1 ;;
+	*)
+		echo "image: NIA_CPM='$cpm' is not a CPM5 PCIe configuration this repository carries" >&2
+		echo "       known: GEN4 (the default), GEN5" >&2
+		return 2 ;;
+	esac
+	note "NIA_CPM" "$cpm"
+	local bin="${NIA_VIVADO_BIN:-vivado}"
+	local out log jou so rc line
+	[ -f "$ip/$tcl" ] || { echo "image: $ip/$tcl is missing"; return 1; }
+	if ! command -v "$bin" >/dev/null 2>&1; then
+		echo "image: '$bin' is not on the path."
+		echo "       Source the settings64.sh of a Vivado install that carries this part, or"
+		echo "       set NIA_VIVADO_BIN to the executable name. A Lab Edition install can"
+		echo "       program a board but cannot build an image."
+		return 1
+	fi
+	out="$ROOT/$outdir"
+	mkdir -p "$out"
+	log="$out/image_build.log"; jou="$out/image_build.jou"; so="$out/image_build.stdout"
+	note "design" "$design"
+	note "tool" "$("$bin" -version 2>/dev/null | head -1)"
+	note "script" "$ip/$tcl"
+	note "log" "${log#"$ROOT"/}"
+	echo "nia-pcie: building the device image; this takes tens of minutes"
+	( cd "$ip" && "$bin" -mode batch -notrace -source "$tcl" -log "$log" -journal "$jou" ) \
+		2>&1 | tee "$so"
+	rc="${PIPESTATUS[0]}"
+	local src="$log"
+	[ -s "$log" ] || src="$so"
+	echo
+	echo "nia-pcie: image build gates, read from the log rather than the exit status"
+	local barmap wns whs nfail noclk pdi
+	barmap="$(grep -m1 'NIA_BARMAP_END' "$src" 2>/dev/null | sed 's/.*bad=//')"
+	wns="$(grep -m1 'NIA_PDI_BUILD WNS' "$src" 2>/dev/null | sed 's/.*= *//')"
+	whs="$(grep -m1 'NIA_PDI_BUILD WHS' "$src" 2>/dev/null | sed 's/.*= *//')"
+	nfail="$(grep -m1 'NIA_PDI_BUILD FAILING_MAX_PATHS' "$src" 2>/dev/null | sed 's/.*= *//')"
+	noclk="$(grep -m1 'NIA_PDI_BUILD check_timing_no_clock' "$src" 2>/dev/null | sed 's/.*= *//')"
+	pdi="$(find "$out" -name '*.pdi' -newer "$jou" 2>/dev/null | head -1)"
+	[ -n "$pdi" ] || pdi="$(find "$out" -name '*.pdi' 2>/dev/null | head -1)"
+
+	[ "${barmap:-x}" = 0 ] && note "CPM_CONFIG words reached the IP" "bad=0" \
+		|| bad "CPM_CONFIG words reached the IP" "bad=${barmap:-not reported}"
+	nonneg "setup slack (WNS)" "$wns"
+	nonneg "hold slack (WHS)" "$whs"
+	[ "${nfail:-x}" = 0 ] && note "failing timing paths" "0" \
+		|| bad "failing timing paths" "${nfail:-not reported}"
+	[ "${noclk:-x}" = 0 ] && note "unconstrained clocks" "0" \
+		|| bad "unconstrained clocks" "${noclk:-not reported}"
+	if [ -n "$pdi" ]; then
+		note "image" "${pdi#"$ROOT"/} ($(stat -c %s "$pdi") B)"
+	else
+		bad "image" "write_device_image produced none"
+	fi
+	grep -q 'NIA_BUILD_DONE rc=0' "$src" 2>/dev/null && note "script reached its end" "rc=0" \
+		|| bad "script reached its end" "$(grep -m1 'NIA_BUILD_DONE' "$src" 2>/dev/null || echo 'no end marker')"
+	[ "$rc" = 0 ] || note "tool exit status" "$rc (the gates above decide, not this)"
+
+	if [ "$extra" = 1 ]; then
+		local widths demoted digest ipset
+		widths="$(grep -m1 'NIA_WIDTHPROBE_END' "$src" 2>/dev/null | sed 's/.*bad=//')"
+		demoted="$(grep -m1 'NIA_DIRECTIVE_END' "$src" 2>/dev/null | sed 's/.*demoted=//')"
+		digest="$(grep -m1 'NIA_RTL_DIGEST_END' "$src" 2>/dev/null | sed 's/.*path=//')"
+		ipset="$(grep -m1 'NIA_IPSET reuse' "$src" 2>/dev/null | sed 's/.*reuse = //')"
+		[ "${widths:-x}" = 0 ] && note "CPM5 tuser and tdata widths" "bad=0" \
+			|| bad "CPM5 tuser and tdata widths" "bad=${widths:-not reported}"
+		[ "${demoted:-x}" = 0 ] && note "implementation directives took" "demoted=0" \
+			|| bad "implementation directives took" "demoted=${demoted:-not reported}"
+		[ -n "$ipset" ] && note "IP set keyed on the request" "$ipset" \
+			|| bad "IP set keyed on the request" "not reported"
+		if [ -n "$digest" ] && [ -f "$digest" ]; then
+			note "RTL digest beside the image" "${digest#"$ROOT"/} ($(grep -c . "$digest") lines)"
+		else
+			bad "RTL digest beside the image" "${digest:-not reported}"
+		fi
+	fi
+
+	if [ "$fail" -eq 0 ]; then
+		echo "nia-pcie: IMAGE PASS"
+	else
+		echo "nia-pcie: IMAGE FAIL, $fail gate(s) not met, see ${src#"$ROOT"/}"
+	fi
+	return "$fail"
+}
+
+nonneg() {
+	local what="$1" v="$2"
+	if [ -z "$v" ]; then bad "$what" "not reported"; return; fi
+	if awk -v x="$v" 'BEGIN{exit !(x+0 >= 0)}'; then note "$what" "$v"; else bad "$what" "$v"; fi
+}
+
+cmd_targets() {
+	if [ ! -f DPDK_TARGET ]; then
+		note "targets" "this repository declares no release targets"
+		return 0
+	fi
+	grep -vE '^#' DPDK_TARGET | grep -vE '^[[:space:]]*$' | while read -r rel status how; do
+		note "$rel" "$status: $how"
+	done
+	local guarded
+	guarded=$(grep -rlE '__has_include|RTE_VERSION_NUM' base pmd 2>/dev/null | wc -l)
+	note "guarded sites" "$guarded file(s) carry a release guard"
+	local unnamed=0 f
+	for f in $(grep -rlE '__has_include|RTE_VERSION_NUM' base pmd 2>/dev/null); do
+		grep -qE '2[0-9]\.[0-9]{2}' "$f" || { unnamed=$((unnamed + 1)); bad "$f" "a release guard that names no release"; }
+	done
+	[ "$unnamed" = 0 ] && note "every guard names a release" "yes"
+	return 0
+}
+
+cmd_clean() {
+	find . -name 'sim_build*' -type d -prune -exec rm -rf {} + 2>/dev/null
+	find . -name 'mut_work' -type d -prune -exec rm -rf {} + 2>/dev/null
+	find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
+	find . -name 'obj_dir' -type d -prune -exec rm -rf {} + 2>/dev/null
+	find . -name 'results*.xml' -delete 2>/dev/null
+	echo "nia-pcie: cleaned"
+}
+
+case "${1:-help}" in
+help)  cmd_help ;;
+deps)  cmd_deps; exit "$fail" ;;
+check) cmd_check ;;
+sim)   cmd_sim ;;
+list)  cmd_list ;;
+image) cmd_image "${2:-}"; exit $? ;;
+targets) cmd_targets; exit "$fail" ;;
+hwtest) echo "nia-pcie: this repository has no hardware test target" >&2; exit 2 ;;
+clean) cmd_clean ;;
+*) echo "nia-pcie: unknown target '$1'" >&2; cmd_help; exit 2 ;;
+esac
